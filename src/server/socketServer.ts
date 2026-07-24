@@ -9,8 +9,17 @@ import { userRoom } from '../types/chat.js';
 import { registerChatHandler } from '../handlers/chatHandler.js';
 import { Log } from '../utils/logger.js';
 import { serverInfo } from '../state/instance.js';
+import { healthState } from '../state/health.js';
 
-export const createSocketServer = async (httpServer: HttpServer): Promise<SocketIOServer> => {
+export type SocketServerHandle = {
+  io: SocketIOServer;
+  /** Disconnects all sockets and closes Valkey clients. */
+  shutdown: () => Promise<void>;
+};
+
+type Closable = { quit?: () => Promise<unknown>; disconnect?: () => void };
+
+export const createSocketServer = async (httpServer: HttpServer): Promise<SocketServerHandle> => {
   const io = new SocketIOServer(httpServer, {
     cors: {
       origin: '*',
@@ -18,14 +27,20 @@ export const createSocketServer = async (httpServer: HttpServer): Promise<Socket
     },
   });
 
+  const closables: Closable[] = [];
+
   // Redis adapter for scaling across multiple instances — degrades to
-  // single-instance operation when Valkey is unreachable
+  // single-instance operation when Valkey is unreachable. The degradation is
+  // reflected in healthState so /ready can pull the instance out of rotation
+  // in deployments that require cross-instance delivery.
   try {
     const { pubClient, subClient } = await createValkeyPair();
+    closables.push(pubClient, subClient);
     const adapter = pubClient instanceof Cluster
       ? createShardedAdapter(pubClient, subClient)
       : createAdapter(pubClient, subClient);
     io.adapter(adapter);
+    healthState.adapterAttached = true;
     Log.info('Socket.IO Redis adapter attached', { tags: ['socket', 'valkey'] });
   } catch (error) {
     Log.warn('Failed to attach Redis adapter — running single-instance only', {
@@ -39,7 +54,9 @@ export const createSocketServer = async (httpServer: HttpServer): Promise<Socket
   // back to an in-memory window.
   try {
     const cacheClient = await createValkeyClient();
+    closables.push(cacheClient);
     initCache(cacheClient);
+    healthState.cacheReady = true;
     Log.info('Cache store initialized', { tags: ['socket', 'store'] });
   } catch (error) {
     Log.warn('Failed to initialize cache store — continuing without cache', {
@@ -82,5 +99,20 @@ export const createSocketServer = async (httpServer: HttpServer): Promise<Socket
     registerChatHandler(socket, io);
   });
 
-  return io;
+  const shutdown = async (): Promise<void> => {
+    // io.close() stops accepting connections and disconnects live sockets
+    await new Promise<void>((resolve) => {
+      io.close(() => resolve());
+    });
+    for (const client of closables) {
+      try {
+        if (client.quit) await client.quit();
+        else client.disconnect?.();
+      } catch {
+        // Best-effort — the process is exiting anyway
+      }
+    }
+  };
+
+  return { io, shutdown };
 };

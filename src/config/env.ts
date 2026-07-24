@@ -12,6 +12,9 @@ const envSchema = z.object({
   API_URL: z.string(),
   // Shared secret for internal server-to-server calls (memo-api <-> memo-socket)
   INTERNAL_SECRET: z.string(),
+  // Set "true" in multi-instance deployments: /ready then fails when the
+  // Valkey adapter is missing (cross-instance delivery would silently break)
+  REQUIRE_ADAPTER: z.enum(['true', 'false']).default('false'),
   AWS_REGION: z.string().default('eu-north-1'),
   DYNAMO_TABLE: z.string().default('memo-chat-messages'),
   // Optional — point at dynamodb-local (e.g. http://127.0.0.1:8000) for local dev

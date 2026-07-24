@@ -15,7 +15,7 @@ const start = async () => {
   const httpServer = createServer(baseApp);
 
   // Socket.IO server (attaches Valkey adapter when available)
-  const io = await createSocketServer(httpServer);
+  const { io, shutdown: shutdownSockets } = await createSocketServer(httpServer);
 
   // Plain HTTP routes (health) + internal server-to-server routes
   baseApp.use(express.json());
@@ -32,6 +32,47 @@ const start = async () => {
       },
     });
   });
+
+  // Graceful shutdown: disconnect sockets, close Valkey clients, then exit.
+  // Clients auto-reconnect to a healthy instance; unsent messages are the
+  // client's to retry (acks make loss visible).
+  const SHUTDOWN_TIMEOUT_MS = 10_000;
+  let shuttingDown = false;
+  const shutdown = (signal: string, exitCode = 0): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    Log.info('Shutting down', {
+      tags: ['socket', 'server', 'shutdown'],
+      meta: { signal, instance: serverInfo.name },
+    });
+
+    const forceExit = setTimeout(() => {
+      Log.error('Shutdown timed out — forcing exit', {
+        tags: ['socket', 'server', 'shutdown'],
+      });
+      process.exit(exitCode || 1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceExit.unref();
+
+    void shutdownSockets()
+      .catch((error) => {
+        Log.error('Shutdown error', {
+          tags: ['socket', 'server', 'shutdown'],
+          meta: { error: error instanceof Error ? error.message : String(error) },
+        });
+      })
+      .finally(() => process.exit(exitCode));
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('uncaughtException', (error) => {
+    Log.error('Uncaught exception', {
+      tags: ['socket', 'process', 'critical'],
+      meta: { error: error.message, stack: error.stack },
+    });
+    shutdown('uncaughtException', 1);
+  });
 };
 
 start().catch((error) => {
@@ -42,18 +83,9 @@ start().catch((error) => {
   process.exit(1);
 });
 
-// Process error handlers
 process.on('unhandledRejection', (reason) => {
   Log.error('Unhandled rejection', {
     tags: ['socket', 'process', 'error'],
     meta: { reason: reason instanceof Error ? reason.message : String(reason) },
   });
-});
-
-process.on('uncaughtException', (error) => {
-  Log.error('Uncaught exception', {
-    tags: ['socket', 'process', 'critical'],
-    meta: { error: error.message, stack: error.stack },
-  });
-  process.exit(1);
 });
