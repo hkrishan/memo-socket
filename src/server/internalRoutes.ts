@@ -28,6 +28,15 @@ const requireInternalSecret = (
   next();
 };
 
+const notifySchema = z.object({
+  userIds: z.array(z.string().min(1)).min(1).max(500),
+  notification: z.object({
+    title: z.string().min(1),
+    body: z.string(),
+    data: z.record(z.string(), z.unknown()).optional(),
+  }),
+});
+
 const dropFiredSchema = z.object({
   memberIds: z.array(z.string().min(1)).min(1).max(500),
   drop: z.object({
@@ -69,6 +78,28 @@ export const createInternalRoutes = (io: SocketIOServer) => {
         eventId: drop.eventId,
         members: memberIds.length,
       },
+    });
+    res.json({ ok: true });
+  });
+
+  // Mirror of a push notification for foregrounded clients: memo-api calls
+  // this alongside every push send; recipients with a live socket render an
+  // in-app banner instead of the OS one.
+  router.post('/internal/notify', requireInternalSecret, (req, res) => {
+    const result = notifySchema.safeParse(req.body);
+    if (!result.success) {
+      res.status(400).json({ error: 'Invalid payload' });
+      return;
+    }
+
+    const { userIds, notification } = result.data;
+    for (const userId of userIds) {
+      io.to(userRoom(userId)).emit('notification:new', notification);
+    }
+
+    Log.info('Notification broadcast to user rooms', {
+      tags: ['notification'],
+      meta: { users: userIds.length },
     });
     res.json({ ok: true });
   });
